@@ -64,6 +64,14 @@ export default function RoomScreen() {
   }, []);
 
   useEffect(() => {
+    return () => {
+      if (socket.connected) {
+        socket.disconnect();
+        console.log("Socket disconnected on screen unmount");
+      }
+    };
+  }, []);
+  useEffect(() => {
     const now = () => Date.now();
 
     const requestNTP = () => {
@@ -187,10 +195,18 @@ export default function RoomScreen() {
 
     const onSpatialUpdate = ({
       source,
+      gains,
     }: {
       source: { x: number; y: number };
+      gains: { [clientId: string]: number };
     }) => {
       setSourcePosition(source);
+
+      const id = clientId.current;
+      if (!id || !sound.current || !gains || !(id in gains)) return;
+
+      const gain = gains[id];
+      sound.current.setVolumeAsync(gain).catch(console.error);
     };
 
     if (!socket.connected) {
@@ -216,7 +232,7 @@ export default function RoomScreen() {
       socket.off("set-client-id", onSetClientId);
       socket.off("spatial-update", onSpatialUpdate);
     };
-  }, [roomId, username]);
+  }, [roomId, timeOffset, username]);
 
   const getSyncedNow = () => Date.now() + timeOffset;
 
