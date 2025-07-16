@@ -66,11 +66,13 @@ export default function RoomScreen() {
   useEffect(() => {
     return () => {
       if (socket.connected) {
+        socket.emit("leave-room", { roomId });
         socket.disconnect();
         console.log("Socket disconnected on screen unmount");
       }
     };
-  }, []);
+  }, [roomId]);
+
   useEffect(() => {
     const now = () => Date.now();
 
