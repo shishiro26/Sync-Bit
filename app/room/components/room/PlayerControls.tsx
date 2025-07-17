@@ -19,16 +19,17 @@ export default function PlayerControls({
     <View style={styles.container}>
       <Image source={coverImage} style={styles.coverImage} resizeMode="cover" />
       <View style={styles.buttonSpacing}>
-        <Button title="Play Synced" onPress={onPlay} />
+        <Button title="Play Synced" onPress={onPlay} disabled={isPlaying} />
       </View>
       <View style={styles.buttonSpacing}>
-        <Button title="Pause Synced" onPress={onPause} />
+        <Button title="Pause Synced" onPress={onPause} disabled={!isPlaying} />
       </View>
       <View style={styles.buttonSpacing}>
         <Button
           title={isSpatialMode ? "Disable Spatial Mode" : "Enable Spatial Mode"}
           color={isSpatialMode ? "tomato" : "green"}
           onPress={onToggleSpatial}
+          disabled={!isPlaying}
         />
       </View>
     </View>

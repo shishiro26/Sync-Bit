@@ -198,11 +198,15 @@ export default function RoomScreen() {
     const onSpatialUpdate = ({
       source,
       gains,
+      enabled,
     }: {
       source: { x: number; y: number };
       gains: { [clientId: string]: number };
+      enabled: boolean;
     }) => {
       setSourcePosition(source);
+
+      setIsSpatialMode(enabled);
 
       const id = clientId.current;
       if (!id || !sound.current || !gains || !(id in gains)) return;
@@ -252,7 +256,6 @@ export default function RoomScreen() {
 
   const handleSpatialToggle = () => {
     const enabled = !isSpatialMode;
-    setIsSpatialMode(enabled);
     socket.emit("toggle-spatial", { roomId, enable: enabled });
   };
 
