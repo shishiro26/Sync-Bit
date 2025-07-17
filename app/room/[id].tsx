@@ -9,6 +9,7 @@ import {
 } from "react-native";
 import { Audio } from "expo-av";
 import { socket } from "@/utils/socket";
+
 import RoomHeader from "./components/room/RoomHeader";
 import PlayerControls from "./components/room/PlayerControls";
 import UserCircle from "./components/room/UserCircle";
@@ -20,14 +21,17 @@ type ClientInfo = {
   position: { x: number; y: number };
 };
 
+type RoomParams = {
+  id: string;
+  username: string;
+};
+
 const assetId = require("@/assets/songs/Monica.mp3");
 const NTP_SAMPLE_COUNT = 8;
+const EXECUTION_THRESHOLD_MS = 10;
 
 export default function RoomScreen() {
-  const { id: roomId, username } = useLocalSearchParams<{
-    id: string;
-    username: string;
-  }>();
+  const { id: roomId, username } = useLocalSearchParams<RoomParams>();
 
   const [clients, setClients] = useState<ClientInfo[]>([]);
   const [sourcePosition, setSourcePosition] = useState({ x: 0, y: 0 });
@@ -44,6 +48,10 @@ export default function RoomScreen() {
   const synced = useRef(false);
   const samples = useRef<{ rtt: number; offset: number }[]>([]);
 
+  const now = () => Date.now();
+
+  const getSyncedNow = () => now() + timeOffset;
+
   useEffect(() => {
     const loadSound = async () => {
       try {
@@ -53,9 +61,10 @@ export default function RoomScreen() {
         });
         sound.current = s;
       } catch (err) {
-        console.error("Sound load error", err);
+        console.error("Error loading audio", err);
       }
     };
+
     loadSound();
 
     return () => {
@@ -68,13 +77,13 @@ export default function RoomScreen() {
       if (socket.connected) {
         socket.emit("leave-room", { roomId });
         socket.disconnect();
-        console.log("Socket disconnected on screen unmount");
+        console.log("[socket] Disconnected on unmount");
       }
     };
   }, [roomId]);
 
   useEffect(() => {
-    const now = () => Date.now();
+    if (!roomId || !username) return;
 
     const requestNTP = () => {
       const t0 = now();
@@ -90,10 +99,8 @@ export default function RoomScreen() {
 
     const onConnect = () => {
       console.log("[socket] Connected");
-      if (roomId && username) {
-        socket.emit("join-room", { roomId, username });
-        setUsersLoading(true);
-      }
+      socket.emit("join-room", { roomId, username });
+      setUsersLoading(true);
 
       if (!synced.current) {
         synced.current = true;
@@ -101,32 +108,17 @@ export default function RoomScreen() {
       }
     };
 
-    const onNtpResponse = ({
-      t0,
-      t1,
-      t2,
-    }: {
-      t0: number;
-      t1: number;
-      t2: number;
-    }) => {
+    const onNtpResponse = (data: { t0: number; t1: number; t2: number }) => {
       const t3 = now();
-      // t3 --:> will be the time when server ninchi vachina request client ki reach aiyyindhi
+      const rtt = t3 - data.t0 - (data.t2 - data.t1);
+      const offset = (data.t1 - data.t0 + data.t2 - t3) / 2;
 
-      const rtt = t3 - t0 - (t2 - t1);
-      // ikkada rtt em chestundhi ante very simple
-      // refer to this https://en.wikipedia.org/wiki/Network_Time_Protocol
-      // (t3-t0) will be the time gap in the client like t0 request sent time and t3 will be the time when the request reached back to it
-      // (t2-t1) will be the time gap in teh server like how much while processing this request
-      const offset = (t1 - t0 + t2 - t3) / 2;
-      // offset --> this formula is just the average between the times of the elapsed time between the client and server and the server and the client;
       samples.current.push({ rtt, offset });
 
       if (samples.current.length === NTP_SAMPLE_COUNT) {
-        const best = [...samples.current].sort((a, b) => a.rtt - b.rtt);
+        const bestSamples = [...samples.current].sort((a, b) => a.rtt - b.rtt);
+        const median = bestSamples[Math.floor(NTP_SAMPLE_COUNT / 2)];
 
-        // in this taking the sorting using the shortest rtt samples in this and taking the median of all this samples for round figure I took the number of samples to be 8;
-        const median = best[Math.floor(NTP_SAMPLE_COUNT / 2)];
         setTimeOffset(median.offset);
         setLatency(
           `Offset: ${median.offset.toFixed(1)}ms, RTT: ${median.rtt.toFixed(
@@ -137,33 +129,24 @@ export default function RoomScreen() {
       }
     };
 
-    const onRoomUpdate = ({
-      clients,
-      songStatus,
-    }: {
+    const onRoomUpdate = (data: {
       clients: ClientInfo[];
       songStatus: boolean;
     }) => {
-      setClients(clients);
-      setIsPlaying(songStatus);
+      setClients(data.clients);
+      setIsPlaying(data.songStatus);
       setUsersLoading(false);
     };
 
-    const onSetClientId = ({ clientId: id }: { clientId: string }) => {
-      clientId.current = id;
+    const onSetClientId = (data: { clientId: string }) => {
+      clientId.current = data.clientId;
     };
 
-    const onPlayAudio = async ({
-      serverTimeToExecute,
-    }: {
-      serverTimeToExecute: number;
-    }) => {
-      const syncedNow = now() + timeOffset;
-      const delay = serverTimeToExecute - syncedNow;
-
+    const onPlayAudio = async (data: { serverTimeToExecute: number }) => {
+      const delay = data.serverTimeToExecute - getSyncedNow();
       if (!sound.current) return;
 
-      if (delay <= 10) {
+      if (delay <= EXECUTION_THRESHOLD_MS) {
         await sound.current.replayAsync();
         setStatus("Playing");
       } else {
@@ -174,17 +157,11 @@ export default function RoomScreen() {
       setIsPlaying(true);
     };
 
-    const onPauseAudio = async ({
-      serverTimeToExecute,
-    }: {
-      serverTimeToExecute: number;
-    }) => {
-      const syncedNow = now() + timeOffset;
-      const delay = serverTimeToExecute - syncedNow;
-
+    const onPauseAudio = async (data: { serverTimeToExecute: number }) => {
+      const delay = data.serverTimeToExecute - getSyncedNow();
       if (!sound.current) return;
 
-      if (delay <= 10) {
+      if (delay <= EXECUTION_THRESHOLD_MS) {
         await sound.current.pauseAsync();
         setStatus("Paused");
       } else {
@@ -195,31 +172,22 @@ export default function RoomScreen() {
       setIsPlaying(false);
     };
 
-    const onSpatialUpdate = ({
-      source,
-      gains,
-      enabled,
-    }: {
+    const onSpatialUpdate = (data: {
       source: { x: number; y: number };
-      gains: { [clientId: string]: number };
+      gains: Record<string, number>;
       enabled: boolean;
     }) => {
-      setSourcePosition(source);
-
-      setIsSpatialMode(enabled);
+      setSourcePosition(data.source);
+      setIsSpatialMode(data.enabled);
 
       const id = clientId.current;
-      if (!id || !sound.current || !gains || !(id in gains)) return;
+      if (!id || !sound.current || !(id in data.gains)) return;
 
-      const gain = gains[id];
-      sound.current.setVolumeAsync(gain).catch(console.error);
+      sound.current.setVolumeAsync(data.gains[id]).catch(console.error);
     };
 
-    if (!socket.connected) {
-      socket.connect();
-    } else {
-      onConnect();
-    }
+    if (!socket.connected) socket.connect();
+    else onConnect();
 
     socket.on("connect", onConnect);
     socket.on("ntp-response", onNtpResponse);
@@ -238,9 +206,7 @@ export default function RoomScreen() {
       socket.off("set-client-id", onSetClientId);
       socket.off("spatial-update", onSpatialUpdate);
     };
-  }, [roomId, timeOffset, username]);
-
-  const getSyncedNow = () => Date.now() + timeOffset;
+  }, [roomId, username, timeOffset]);
 
   const handlePlay = () => {
     const executeAt = getSyncedNow() + 10;
@@ -255,8 +221,7 @@ export default function RoomScreen() {
   };
 
   const handleSpatialToggle = () => {
-    const enabled = !isSpatialMode;
-    socket.emit("toggle-spatial", { roomId, enable: enabled });
+    socket.emit("toggle-spatial", { roomId, enable: !isSpatialMode });
   };
 
   return (
@@ -278,8 +243,11 @@ export default function RoomScreen() {
             onToggleSpatial={handleSpatialToggle}
             coverImage={require("@/assets/images/MonicaCover.png")}
           />
+
           <UserList clients={clients} loading={usersLoading} />
+
           <UserCircle clients={clients} sourcePosition={sourcePosition} />
+
           <Text style={styles.status}>{status}</Text>
         </>
       )}
