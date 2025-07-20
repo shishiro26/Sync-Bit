@@ -33,6 +33,7 @@ export default function HomeScreen() {
 
     const handleConnect = () => console.log("Socket connected:", socket.id);
     const handleDisconnect = () => console.warn("Socket disconnected");
+
     const handleRoomCreated = ({ roomId }: { roomId: string }) => {
       setIsLoading(false);
       setLoadingAction(null);
@@ -41,6 +42,19 @@ export default function HomeScreen() {
         params: { id: roomId, username },
       });
     };
+
+    const handleRoomJoined = ({ roomId }: { roomId: string }) => {
+      setIsLoading(false);
+      setLoadingAction(null);
+    };
+
+    const handleError = ({ message }: { message: string }) => {
+      console.error("Socket error:", message);
+      Alert.alert("Error", message);
+      setIsLoading(false);
+      setLoadingAction(null);
+    };
+
     const handleJoinFailed = ({ reason }: { reason: string }) => {
       setIsLoading(false);
       setLoadingAction(null);
@@ -50,12 +64,16 @@ export default function HomeScreen() {
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     socket.on("room-created", handleRoomCreated);
+    socket.on("room-joined", handleRoomJoined);
+    socket.on("error", handleError);
     socket.on("join-failed", handleJoinFailed);
 
     return () => {
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
       socket.off("room-created", handleRoomCreated);
+      socket.off("room-joined", handleRoomJoined);
+      socket.off("error", handleError);
       socket.off("join-failed", handleJoinFailed);
     };
   }, [username]);
@@ -86,6 +104,7 @@ export default function HomeScreen() {
       params: { id: roomId, username },
     });
   };
+
   return (
     <SafeAreaProvider>
       <View style={[styles.gradient, { backgroundColor: COLORS.bgMain }]}>
