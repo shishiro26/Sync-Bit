@@ -1,13 +1,36 @@
 import { socket } from "@/utils/socket";
-import { Audio } from "expo-av";
 import { router, useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-type ClientInfo = {
-  clientId: string;
+interface ClientInfo {
+  id: string;
   username: string;
   position: { x: number; y: number };
-};
+}
+
+interface Song {
+  id: string;
+  songUrl: string;
+  hlsUrl: string;
+  uploadedAt: number;
+  duration: number;
+}
+
+interface SpatialData {
+  source: { x: number; y: number };
+  gains: Record<string, number>;
+  enabled: boolean;
+  positions: Record<string, { x: number; y: number }>;
+}
+
+interface PlaybackSyncData {
+  songId: string;
+  isPlaying: boolean;
+  playbackStartTime: number;
+  currentTime: number;
+  serverTime: number;
+  hlsUrl: string;
+}
 
 export function useRoomLogic() {
   const { id: roomId, username } = useLocalSearchParams<{
@@ -15,292 +38,365 @@ export function useRoomLogic() {
     username: string;
   }>();
 
+  // Room state
   const [users, setUsers] = useState<ClientInfo[]>([]);
   const [usersLoading, setUsersLoading] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState("Connecting...");
 
+  // Audio state
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [audioLoading, setAudioLoading] = useState(false);
+  const [currentSong, setCurrentSong] = useState<string | null>(null);
+  const [currentHlsUrl, setCurrentHlsUrl] = useState<string | null>(null);
+
+  // Spatial audio
+  const [isSpatialMode, setIsSpatialMode] = useState(false);
   const [sourcePosition, setSourcePosition] = useState({ x: 0, y: 0 });
 
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [isSpatialMode, setIsSpatialMode] = useState(false);
-
-  const [status, setStatus] = useState("⏸");
-  const [audioLoading, setAudioLoading] = useState(true);
-
-  const [offset, setOffset] = useState(0);
-  const offsetRef = useRef(0);
+  // Sync metrics
   const [rtt, setRtt] = useState(0);
+  const [offset, setOffset] = useState(0);
 
-  const [loading, setLoading] = useState(true);
-
-  const sound = useRef<Audio.Sound | null>(null);
+  // Refs
   const clientId = useRef<string>("");
+  const hlsPlayerRef = useRef<any>(null);
+  const syncSamples = useRef<{ rtt: number; offset: number }[]>([]);
+  const offsetRef = useRef(0);
+  const isSynced = useRef(false);
+  const hasJoined = useRef(false);
 
-  const samples = useRef<{ rtt: number; offset: number }[]>([]);
-  const synced = useRef(false);
-  const joined = useRef(false);
+  const now = useCallback(() => Date.now(), []);
+  const getSyncedTime = useCallback(() => now() + offsetRef.current, [now]);
 
-  useEffect(() => {
-    let unload: (() => void) | null = null;
+  const performTimeSync = useCallback(() => {
+    syncSamples.current = [];
+    for (let i = 0; i < 10; i++) {
+      setTimeout(() => {
+        socket.emit("ping", { timestamp: now() });
+      }, i * 50);
+    }
+  }, [now]);
 
-    (async () => {
+  const syncHLSPlayback = useCallback(
+    async (data: PlaybackSyncData) => {
+      if (!hlsPlayerRef.current) return;
+
       try {
         setAudioLoading(true);
-        const { sound: s } = await Audio.Sound.createAsync(
-          require("@/assets/songs/Monica.mp3"),
-          { shouldPlay: false, isLooping: true }
-        );
-        sound.current = s;
-        unload = () => s.unloadAsync().catch(console.error);
+
+        if (currentHlsUrl !== data.hlsUrl) {
+          setCurrentHlsUrl(data.hlsUrl);
+          await hlsPlayerRef.current.loadSource(data.hlsUrl);
+        }
+
+        const syncedNow = getSyncedTime();
+        let seekTime = 0;
+
+        if (data.isPlaying && data.playbackStartTime > 0) {
+          if (syncedNow >= data.playbackStartTime) {
+            seekTime = data.currentTime + (syncedNow - data.serverTime);
+          } else {
+            seekTime = data.currentTime;
+          }
+        } else {
+          seekTime = data.currentTime;
+        }
+
+        await hlsPlayerRef.current.seekTo(Math.max(0, seekTime / 1000));
+
+        if (data.isPlaying) {
+          if (syncedNow >= data.playbackStartTime) {
+            await hlsPlayerRef.current.play();
+            setIsPlaying(true);
+            setStatus("Playing");
+          } else {
+            const delay = data.playbackStartTime - syncedNow;
+            setStatus(`Starting in ${Math.ceil(delay / 1000)}s`);
+            setTimeout(async () => {
+              await hlsPlayerRef.current.play();
+              setIsPlaying(true);
+              setStatus("Playing");
+            }, delay);
+          }
+        } else {
+          await hlsPlayerRef.current.pause();
+          setIsPlaying(false);
+          setStatus("Paused");
+        }
+      } catch (error) {
+        console.error("HLS sync error:", error);
+        setStatus("Sync error");
       } finally {
         setAudioLoading(false);
       }
-    })();
-
-    return () => unload?.();
-  }, []);
-
-  const now = useCallback(() => Date.now(), []);
-  const getSyncedNow = useCallback(() => now() + offsetRef.current, [now]);
+    },
+    [currentHlsUrl, getSyncedTime]
+  );
 
   useEffect(() => {
     if (!roomId || !username) return;
-    const requestNtp = () => {
-      const t0 = now();
-      socket.emit("ntp-request", { t0 });
-    };
 
-    const startNtpSync = () => {
-      samples.current = [];
-      for (let i = 0; i < 8; i++) setTimeout(requestNtp, i * 80);
-    };
-
-    const onConnect = () => {
+    const handleConnect = () => {
+      setStatus("Joining room...");
       socket.emit("join-room", { roomId, username });
-      setUsersLoading(true);
-      startNtpSync();
+      performTimeSync();
     };
 
-    const onJoinFailed = ({ reason }: { reason: string }) => {
-      console.warn("join-failed:", reason);
-      router.replace("/");
+    const handleRoomJoined = (data: {
+      roomId: string;
+      currentSong?: string;
+      isPlaying: boolean;
+      songElapsedTime: number;
+      playbackStartTime?: number;
+      serverTime: number;
+      hlsUrl?: string;
+      songs: Song[];
+    }) => {
+      hasJoined.current = true;
+      setLoading(false);
+      setStatus("Connected");
+
+      if (data.currentSong && data.hlsUrl) {
+        setCurrentSong(data.currentSong);
+        if (isSynced.current) {
+          syncHLSPlayback({
+            songId: data.currentSong,
+            isPlaying: data.isPlaying,
+            playbackStartTime: data.playbackStartTime || 0,
+            currentTime: data.songElapsedTime,
+            serverTime: data.serverTime,
+            hlsUrl: data.hlsUrl,
+          });
+        }
+      }
     };
 
-    const onRoomJoined = () => {
-      joined.current = true;
-      if (synced.current) socket.emit("get-room-state");
+    const handleSetClientId = ({ clientId: id }: { clientId: string }) => {
+      clientId.current = id;
     };
 
-    const onSetClientId = ({ clientId: cid }: { clientId: string }) => {
-      clientId.current = cid;
-    };
-
-    const onRoomUpdate = ({ clients }: { clients: ClientInfo[] }) => {
+    const handleRoomUpdate = ({ clients }: { clients: ClientInfo[] }) => {
       setUsers(clients);
       setUsersLoading(false);
     };
 
-    const onRoomState = async (state: {
-      roomId: string;
-      clients: ClientInfo[];
-      spatialEnabled: boolean;
-      songEnabled: boolean;
-      songDuration: number;
+    const handlePong = ({
+      timestamp,
+      serverTime,
+    }: {
+      timestamp: number;
+      serverTime: number;
+    }) => {
+      const clientTime = now();
+      const rttSample = clientTime - timestamp;
+      const offsetSample = serverTime - (timestamp + rttSample / 2);
+
+      syncSamples.current.push({ rtt: rttSample, offset: offsetSample });
+
+      if (syncSamples.current.length >= 10) {
+        const sorted = syncSamples.current.sort((a, b) => a.rtt - b.rtt);
+        const best = sorted.slice(0, 5);
+        const avgOffset =
+          best.reduce((sum, s) => sum + s.offset, 0) / best.length;
+        const avgRtt = best.reduce((sum, s) => sum + s.rtt, 0) / best.length;
+
+        offsetRef.current = avgOffset;
+        setOffset(avgOffset);
+        setRtt(avgRtt);
+        isSynced.current = true;
+        setStatus("Synced");
+
+        if (hasJoined.current) {
+          socket.emit("sync-request", { roomId });
+        }
+      }
+    };
+
+    const handlePlaybackSync = (data: PlaybackSyncData) => {
+      if (isSynced.current) {
+        syncHLSPlayback(data);
+      }
+    };
+
+    const handleSongStarted = (data: {
+      songId: string;
+      hlsUrl: string;
+      isPlaying: boolean;
+      elapsedTime: number;
+      playbackStartTime: number;
+      serverTime: number;
+    }) => {
+      setCurrentSong(data.songId);
+      if (isSynced.current) {
+        syncHLSPlayback({
+          songId: data.songId,
+          isPlaying: data.isPlaying,
+          playbackStartTime: data.playbackStartTime,
+          currentTime: data.elapsedTime,
+          serverTime: data.serverTime,
+          hlsUrl: data.hlsUrl,
+        });
+      }
+    };
+
+    const handleSongPaused = (data: {
+      songId: string;
+      isPlaying: boolean;
       elapsedTime: number;
       serverTime: number;
     }) => {
-      setUsers(state.clients);
-      setUsersLoading(false);
-      setIsSpatialMode(state.spatialEnabled);
-
-      if (!sound.current) return;
-
-      const nowSynced = getSyncedNow();
-      const targetPos = state.elapsedTime + (nowSynced - state.serverTime);
-
-      await sound.current.setPositionAsync(Math.max(0, targetPos));
-      if (state.songEnabled) {
-        await sound.current.playAsync();
-        setIsPlaying(true);
-        setStatus("Playing");
-      } else {
-        await sound.current.pauseAsync();
-        setIsPlaying(false);
-        setStatus("Paused");
+      setIsPlaying(false);
+      if (hlsPlayerRef.current) {
+        hlsPlayerRef.current.pause();
       }
+      setStatus("Paused");
     };
 
-    const onAudioCommand = (cmd: {
-      action: "play" | "pause" | "seek";
+    const handleSongResumed = (data: {
+      songId: string;
+      hlsUrl: string;
+      isPlaying: boolean;
+      elapsedTime: number;
+      playbackStartTime: number;
       serverTime: number;
-      elapsedTime?: number;
-      position?: number;
-      songEnabled?: boolean;
     }) => {
-      if (!sound.current) return;
-      const delay = cmd.serverTime - getSyncedNow();
-
-      const exec = async () => {
-        switch (cmd.action) {
-          case "play":
-            if (cmd.elapsedTime != null) {
-              await sound.current!.setPositionAsync(cmd.elapsedTime);
-            }
-            await sound.current!.playAsync();
-            setIsPlaying(true);
-            setStatus("Playing");
-            break;
-
-          case "pause":
-            await sound.current!.pauseAsync();
-            setIsPlaying(false);
-            setStatus("Paused");
-            break;
-
-          case "seek":
-            if (cmd.position != null) {
-              await sound.current!.setPositionAsync(cmd.position);
-              setStatus(`Seek to ${cmd.position.toFixed(0)}ms`);
-            }
-            if (cmd.songEnabled) {
-              await sound.current!.playAsync();
-              setIsPlaying(true);
-            } else {
-              setIsPlaying(false);
-            }
-            break;
-        }
-      };
-
-      if (delay <= 10) exec();
-      else {
-        setStatus(`Scheduled ${cmd.action} in ${delay.toFixed(0)}ms`);
-        setTimeout(exec, delay);
+      if (isSynced.current) {
+        syncHLSPlayback({
+          songId: data.songId,
+          isPlaying: data.isPlaying,
+          playbackStartTime: data.playbackStartTime,
+          currentTime: data.elapsedTime,
+          serverTime: data.serverTime,
+          hlsUrl: data.hlsUrl,
+        });
       }
     };
 
-    const onNtpResponse = (msg: { t0: number; t1: number; t2: number }) => {
-      const t3 = now();
-      const rttSample = t3 - msg.t0 - (msg.t2 - msg.t1);
-      const offsetSample = (msg.t1 - msg.t0 + msg.t2 - t3) / 2;
-
-      samples.current.push({ rtt: rttSample, offset: offsetSample });
-
-      if (samples.current.length === 8) {
-        const sorted = samples.current.sort((a, b) => a.rtt - b.rtt);
-        const median = sorted[Math.floor(sorted.length / 2)];
-
-        console.log(
-          `NTP median: rtt=${median.rtt.toFixed(
-            2
-          )}ms, offset=${median.offset.toFixed(2)}ms`
-        );
-
-        offsetRef.current = median.offset;
-        setOffset(median.offset);
-        setRtt(median.rtt);
-        setLoading(false);
-        setStatus("Synced");
-        synced.current = true;
-
-        if (joined.current) socket.emit("get-room-state");
+    const handleSongStopped = () => {
+      setCurrentSong(null);
+      setCurrentHlsUrl(null);
+      setIsPlaying(false);
+      setStatus("Stopped");
+      if (hlsPlayerRef.current) {
+        hlsPlayerRef.current.pause();
+        hlsPlayerRef.current.seekTo(0);
       }
     };
 
-    const onSpatialToggled = ({ enabled }: { enabled: boolean }) => {
-      setIsSpatialMode(enabled);
-      if (!sound.current) return;
-      if (!enabled) sound.current.setVolumeAsync(1).catch(console.error);
+    const handleSpatialToggled = ({
+      spatialEnabled,
+    }: {
+      spatialEnabled: boolean;
+    }) => {
+      setIsSpatialMode(spatialEnabled);
     };
 
-    const onSpatialUpdate = (data: {
-      source: { x: number; y: number };
-      gains: Record<string, number>;
-      enabled: boolean;
-    }) => {
+    const handleSpatialUpdate = (data: SpatialData) => {
       setSourcePosition(data.source);
       setIsSpatialMode(data.enabled);
-      const id = clientId.current;
-      if (!id || !sound.current || !(id in data.gains)) return;
-      sound.current.setVolumeAsync(data.gains[id]).catch(console.error);
+
+      const myId = clientId.current;
+      if (myId && data.gains[myId] !== undefined && hlsPlayerRef.current) {
+        hlsPlayerRef.current.setVolume(data.gains[myId]);
+      }
     };
 
-    const onError = ({ message }: { message: string }) => {
-      console.error("socket error:", message);
+    const handleError = ({ message }: { message: string }) => {
+      setStatus(`Error: ${message}`);
     };
 
-    socket.on("connect", onConnect);
-    socket.on("join-failed", onJoinFailed);
-    socket.on("room-joined", onRoomJoined);
-    socket.on("set-client-id", onSetClientId);
-    socket.on("room-update", onRoomUpdate);
-    socket.on("room-state", onRoomState);
-    socket.on("audio-command", onAudioCommand);
-    socket.on("ntp-response", onNtpResponse);
-    socket.on("spatial-toggled", onSpatialToggled);
-    socket.on("spatial-update", onSpatialUpdate);
-    socket.on("error", onError);
+    const handleDisconnect = () => {
+      setStatus("Disconnected");
+      setLoading(true);
+      isSynced.current = false;
+      hasJoined.current = false;
+    };
+
+    socket.on("connect", handleConnect);
+    socket.on("room-joined", handleRoomJoined);
+    socket.on("set-client-id", handleSetClientId);
+    socket.on("room-update", handleRoomUpdate);
+    socket.on("pong", handlePong);
+    socket.on("playback-sync", handlePlaybackSync);
+    socket.on("song-started", handleSongStarted);
+    socket.on("song-paused", handleSongPaused);
+    socket.on("song-resumed", handleSongResumed);
+    socket.on("song-stopped", handleSongStopped);
+    socket.on("spatial-toggled", handleSpatialToggled);
+    socket.on("spatial-update", handleSpatialUpdate);
+    socket.on("error", handleError);
+    socket.on("disconnect", handleDisconnect);
 
     if (socket.connected) {
-      onConnect();
+      handleConnect();
     } else {
       socket.connect();
     }
 
     return () => {
-      socket.off("connect", onConnect);
-      socket.off("join-failed", onJoinFailed);
-      socket.off("room-joined", onRoomJoined);
-      socket.off("set-client-id", onSetClientId);
-      socket.off("room-update", onRoomUpdate);
-      socket.off("room-state", onRoomState);
-      socket.off("audio-command", onAudioCommand);
-      socket.off("ntp-response", onNtpResponse);
-      socket.off("spatial-toggled", onSpatialToggled);
-      socket.off("spatial-update", onSpatialUpdate);
-      socket.off("error", onError);
-    };
-  }, [roomId, username, getSyncedNow, now]);
+      socket.off("connect", handleConnect);
+      socket.off("room-joined", handleRoomJoined);
+      socket.off("set-client-id", handleSetClientId);
+      socket.off("room-update", handleRoomUpdate);
+      socket.off("pong", handlePong);
+      socket.off("playback-sync", handlePlaybackSync);
+      socket.off("song-started", handleSongStarted);
+      socket.off("song-paused", handleSongPaused);
+      socket.off("song-resumed", handleSongResumed);
+      socket.off("song-stopped", handleSongStopped);
+      socket.off("spatial-toggled", handleSpatialToggled);
+      socket.off("spatial-update", handleSpatialUpdate);
+      socket.off("error", handleError);
+      socket.off("disconnect", handleDisconnect);
 
-  const onLeaveRoom = useCallback(() => {
-    socket.emit("leave-room");
-    sound.current?.pauseAsync().catch(console.error);
-    router.replace("/");
-  }, []);
+      if (hlsPlayerRef.current) {
+        hlsPlayerRef.current.destroy();
+      }
+    };
+  }, [roomId, username, now, performTimeSync, syncHLSPlayback]);
 
   const handlePlay = useCallback(() => {
-    const songDuration = 240_000;
-    socket.emit("play-audio", {
-      serverTimeToExecute: Date.now() + offsetRef.current + 100,
-      songDuration,
-      songUrl: "",
-    });
-    setStatus("Sent play");
-  }, []);
+    if (!roomId || !currentSong) return;
+    socket.emit("song-resume", { roomId });
+  }, [roomId, currentSong]);
 
   const handlePause = useCallback(() => {
-    socket.emit("pause-audio", {
-      serverTimeToExecute: Date.now() + offsetRef.current + 100,
-    });
-    setStatus("Sent pause");
-  }, []);
+    if (!roomId) return;
+    socket.emit("song-pause", { roomId });
+  }, [roomId]);
 
   const handleSpatialToggle = useCallback(() => {
-    socket.emit("toggle-spatial", { roomId, enable: !isSpatialMode });
+    if (!roomId) return;
+    socket.emit("spatial-toggle", { roomId, spatialEnabled: !isSpatialMode });
   }, [roomId, isSpatialMode]);
 
+  const onLeaveRoom = useCallback(() => {
+    if (roomId) {
+      socket.emit("leave-room", { roomId });
+    }
+    if (hlsPlayerRef.current) {
+      hlsPlayerRef.current.destroy();
+    }
+    router.replace("/");
+  }, [roomId]);
+
   return {
-    roomId: roomId ?? "n/a",
-    username: username ?? "n/a",
+    roomId: roomId || "",
+    username: username || "",
     users,
     usersLoading,
     sourcePosition,
     isPlaying,
     isSpatialMode,
+    currentSong,
+    currentHlsUrl,
     status,
     audioLoading,
     offset,
     rtt,
     loading,
+    hlsPlayerRef,
     onLeaveRoom,
     handlePlay,
     handlePause,
